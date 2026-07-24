@@ -788,7 +788,7 @@ function getFixedQuestions(){
       options: [
         { value: 'very',     label: 'Very important — we need a consistent recurring slot' },
         { value: 'somewhat', label: 'Somewhat — we try to keep it consistent but can flex' },
-        { value: 'flexible', label: 'Not important — we’ll schedule session by session' },
+        { value: 'flexible', label: 'Not important — we\'ll schedule session by session' },
       ],
     },
     {
@@ -873,15 +873,11 @@ function availableTypes(){
   const currentStep = state.sessionStep;
   const hasPT = state.answers.practicetestplan === 'yes';
 
-  // Look at sessions *before* the current one to determine what's already placed
   const priorSessions = sessions.slice(0, currentStep);
 
-  // beforept placed anywhere (including current session) unlocks afterpt
   const prepPTUsed = sessions.some(s => s && s.type === 'beforept');
   const lastType = priorSessions.length > 0 ? priorSessions[priorSessions.length - 1].type : null;
 
-  // Can't go backwards — figure out minimum position in the progression.
-  // "Same stage" is always allowed for all types including Intro.
   const ORDER = ['intro','checkin','beforept','afterpt','testday'];
   const lastIdx = lastType ? ORDER.indexOf(lastType) : -1;
   const minIdx = Math.max(0, lastIdx);
@@ -911,38 +907,120 @@ function buildTimeline(){
   const test  = parseDate(state.answers.testdate);
   if (!start || !test) return { sessionWeeks:[], ptWeek:null };
 
-  const totalWeeks = weeksBetween(start, test);
-  const N = parseInt(state.answers.sessioncount) || 3;
   const sessions = state.answers.sessions;
+  const N = sessions.length;
+  if (N === 0) return { sessionWeeks:[], ptWeek:null };
+
   const hasPT = state.answers.practicetestplan === 'yes';
+  const totalWeeks = weeksBetween(start, test);
 
-  // Find index of first reviewpt or first testday to determine where to place
-  // the practice test marker. Rules:
-  //  - If reviewpt exists: place it the week before reviewpt
-  //  - If no reviewpt but testday exists: place it the week before first testday
-  //  - Must always come after preppt if preppt exists
-  //  - If timeline is too tight for a full week gap, place it same week
-  const reviewPTIdx = sessions.findIndex(sess => sess.type === 'afterpt');
-  const testDayIdx  = sessions.findIndex(sess => sess.type === 'testday');
-  const anchorIdx   = reviewPTIdx !== -1 ? reviewPTIdx : testDayIdx;
+  // If start date is Friday (5) or Saturday (6), no session can happen until
+  // the following week. minWeek is the earliest valid session week (0-indexed).
+  const dow = start.getDay();
+  const minWeek = (dow === 5 || dow === 6) ? 1 : 0;
 
-  // Spread sessions evenly across the available weeks
-  const sessionWeeks = sessions.map((sess, i) => {
-    const t = N === 1 ? 1 : i / (N - 1);
-    const weekNum = Math.round(t * (totalWeeks - 1));
-    const date = addDays(start, weekNum * 7);
-    return weekLabel(date);
+  // Count sessions by type
+  const typeCounts = {};
+  sessions.forEach(s => { typeCounts[s.type] = (typeCounts[s.type]||0)+1; });
+
+  const numTestday  = typeCounts.testday  || 0;
+  const numAfterpt  = typeCounts.afterpt  || 0;
+  const numBeforept = typeCounts.beforept || 0;
+  const numIntro    = typeCounts.intro    || 0;
+
+  // ── Anchor weeks, computed backwards from test date ───────────────────────
+  //
+  // testday  → last N weeks before the test
+  // afterpt  → sits just before testday; PT marker goes 1 week before first afterpt
+  // beforept → student finishes binder before PT, so beforept ends 1 week before PT
+  // checkin  → fills the study zone between intro (or minWeek) and beforept
+  // intro    → minWeek (week 0 normally; week 1 if start is Fri or Sat)
+  //
+  // All values are clamped to [minWeek, totalWeeks] — nothing before the start
+  // date, nothing after the test date.
+
+  function clamp(v){ return Math.min(Math.max(v, minWeek), totalWeeks); }
+
+  const testdayEnd   = totalWeeks - 1;
+  const testdayStart = clamp(testdayEnd - (numTestday - 1));
+
+  const afterptEnd   = clamp(testdayStart - 1);
+  const afterptStart = clamp(afterptEnd - Math.max(0, numAfterpt - 1));
+
+  // PT goes 1 week before first afterpt (or 1 week before testday if no afterpt)
+  const ptAnchorIdx = sessions.findIndex(s => s.type === 'afterpt');
+  const ptRefWeek   = numAfterpt > 0 ? afterptStart
+                    : numTestday > 0  ? testdayStart
+                    :                   totalWeeks - 1;
+  const ptWeekNum   = clamp(ptRefWeek - 1);
+
+  // beforept: student should finish all binder lessons before taking the PT
+  const beforeptEnd   = clamp(ptWeekNum - 1);
+  const beforeptStart = clamp(beforeptEnd - Math.max(0, numBeforept - 1));
+
+  // checkin: fills the study zone between intro (or minWeek) and the next phase
+  const checkinCeiling = numBeforept > 0 ? beforeptStart - 1
+                       : numAfterpt  > 0 ? afterptStart  - 1
+                       :                   testdayStart  - 1;
+  const checkinEnd   = clamp(checkinCeiling);
+  const checkinStart = clamp(numIntro > 0 ? 1 : minWeek);
+
+  // ── Assign a week number to each session ──────────────────────────────────
+  const typeIdx = {};  // how many of each type placed so far (0-based)
+  const sessionWeekNums = sessions.map((sess) => {
+    const t = sess.type;
+    const idx = typeIdx[t] === undefined ? (typeIdx[t] = 0) : ++typeIdx[t];
+
+    if (t === 'intro') return minWeek;
+
+    if (t === 'checkin'){
+      const span  = Math.max(0, checkinEnd - checkinStart);
+      const count = typeCounts.checkin || 1;
+      if (count === 1) return clamp(Math.round(checkinStart + span / 2));
+      return clamp(checkinStart + Math.round((idx / (count - 1)) * span));
+    }
+
+    if (t === 'beforept'){
+      const span  = Math.max(0, beforeptEnd - beforeptStart);
+      const count = typeCounts.beforept || 1;
+      if (count === 1) return beforeptEnd;
+      return clamp(beforeptStart + Math.round((idx / (count - 1)) * span));
+    }
+
+    if (t === 'afterpt'){
+      const span  = Math.max(0, afterptEnd - afterptStart);
+      const count = typeCounts.afterpt || 1;
+      if (count === 1) return afterptStart;
+      return clamp(afterptStart + Math.round((idx / (count - 1)) * span));
+    }
+
+    if (t === 'testday'){
+      const span  = Math.max(0, testdayEnd - testdayStart);
+      const count = typeCounts.testday || 1;
+      if (count === 1) return testdayEnd;
+      return clamp(testdayStart + Math.round((idx / (count - 1)) * span));
+    }
+
+    return minWeek;
   });
 
-  // Place the practice test the week before the anchor session
+  // Ensure non-decreasing order (sessions can't go backwards in time)
+  for (let i = 1; i < sessionWeekNums.length; i++){
+    if (sessionWeekNums[i] <= sessionWeekNums[i - 1]){
+      sessionWeekNums[i] = sessionWeekNums[i - 1] + 1;
+    }
+    sessionWeekNums[i] = Math.min(sessionWeekNums[i], totalWeeks);
+  }
+
+  const sessionWeeks = sessionWeekNums.map(wn => weekLabel(addDays(start, wn * 7)));
+
+  // PT week label (only shown if student said yes to practice test)
   let ptWeek = null;
-  if (hasPT && anchorIdx !== -1) {
-    const anchorWeekNum = N === 1 ? totalWeeks - 1 : Math.round((anchorIdx / (N - 1)) * (totalWeeks - 1));
-    const ptWeekNum = Math.max(0, anchorWeekNum - 1);
+  if (hasPT){
     ptWeek = weekLabel(addDays(start, ptWeekNum * 7));
   }
 
-  return { sessionWeeks, ptWeek, ptAnchorIdx: anchorIdx };
+  return { sessionWeeks, ptWeek, ptAnchorIdx };
 }
 
 // ─────────────────────────────────────────────
@@ -951,7 +1029,6 @@ function buildTimeline(){
 function computeProgress(){
   const N = parseInt(state.answers.sessioncount) || 3;
   const fixedTotal = getFixedQuestions().length;
-  // Each session = 2 sub-steps (type + goals)
   const sessionTotal = N * 2;
   const total = fixedTotal + sessionTotal;
 
@@ -975,8 +1052,6 @@ function pushHistory(){
     sessionSubStep: state.sessionSubStep,
     answers: JSON.parse(JSON.stringify(state.answers)),
   });
-  // Any forward history is invalidated when we branch in a new direction
-  // UNLESS the new step matches the saved forward step exactly
   if (state.future && state.future.length > 0){
     const next = state.future[state.future.length - 1];
     const sameStep = next.phase === state.phase &&
@@ -988,7 +1063,6 @@ function pushHistory(){
 }
 function popHistory(){
   if (state.history.length === 0) return;
-  // Save current state to future stack before going back
   if (!state.future) state.future = [];
   state.future.push({
     phase: state.phase,
@@ -1008,7 +1082,6 @@ function popHistory(){
 function popFuture(){
   if (!state.future || state.future.length === 0) return false;
   const next = state.future.pop();
-  // Push current state to history before going forward
   state.history.push({
     phase: state.phase,
     fixedStep: state.fixedStep,
@@ -1125,7 +1198,6 @@ function renderFixed(s){
       btn.className = 'opt' + (state.answers[q.id]===o.value?' selected':'');
       btn.innerHTML = `<span class="opt-marker">${String.fromCharCode(65+i)}</span><span>${o.label}</span>`;
       btn.onclick = () => {
-        // If switching test type, clear subjects so stale options don't carry over
         if (q.id === 'testtype' && state.answers.testtype !== o.value){
           state.answers.subjects = [];
         }
@@ -1141,7 +1213,6 @@ function renderFixed(s){
     note.textContent = 'Select all that apply';
     s.insertBefore(note, opts);
     const sel = state.answers[q.id] || [];
-    // Hide "Select all that apply" hint when notsure is the only selection
     if (sel.includes('notsure')) note.style.display = 'none';
 
     if (q.style === 'day-circles'){
@@ -1168,7 +1239,6 @@ function renderFixed(s){
       const btn = document.createElement('button');
       const isSelected = sel.includes(o.value);
       const isNotSureOpt = o.value === 'notsure';
-      // notsure uses a round radio marker; regular options use a square checkbox
       const markerClass = isNotSureOpt ? 'opt-marker' : 'opt-marker square';
       const markerInner = isSelected ? (isNotSureOpt ? '&#9679;' : '&#10003;') : '';
       btn.className = 'opt' + (isSelected?' selected':'') + (isNotSureOpt?' opt-notsure':'');
@@ -1177,10 +1247,8 @@ function renderFixed(s){
       btn.onclick = () => {
         const cur = state.answers[q.id] || [];
         if (o.value === 'notsure'){
-          // "Not sure" is mutually exclusive — selecting it clears everything else
           state.answers[q.id] = cur.includes('notsure') ? [] : ['notsure'];
         } else {
-          // Selecting any real option clears "not sure", then toggles this value
           const without = cur.filter(x => x !== 'notsure');
           state.answers[q.id] = without.includes(o.value)
             ? without.filter(x => x !== o.value)
@@ -1190,7 +1258,7 @@ function renderFixed(s){
       };
       opts.appendChild(btn);
     });
-    } // end else (non-day-circles)
+    }
     canNext = (state.answers[q.id]||[]).length > 0;
   } else if (q.type === 'textarea'){
     const ta = document.createElement('textarea');
@@ -1199,7 +1267,6 @@ function renderFixed(s){
     ta.placeholder = q.placeholder || '';
     ta.value = state.answers[q.id] || '';
     opts.appendChild(ta);
-    // Optional fields are always allowed to proceed
     canNext = q.optional ? true : !!ta.value.trim();
     ta.oninput = () => {
       state.answers[q.id] = ta.value;
@@ -1208,7 +1275,6 @@ function renderFixed(s){
     setTimeout(() => ta.focus(), 50);
   }
 
-  // nav
   const nav = document.createElement('div');
   nav.className = 'nav';
   const backBtn = document.createElement('button');
@@ -1217,7 +1283,7 @@ function renderFixed(s){
   backBtn.onclick = () => popHistory();
   const nextBtn = document.createElement('button');
   nextBtn.className = 'btn btn-primary';
-  nextBtn.textContent = state.fixedStep === qs.length-1 ? 'Next →' : 'Next →';
+  nextBtn.textContent = 'Next →';
   nextBtn.disabled = !canNext;
   nextBtn.onclick = advance;
   nav.appendChild(backBtn);
@@ -1259,7 +1325,6 @@ function renderSession(s){
   s.innerHTML = '<div class="kicker">Question ' + qNum + ' of ' + total + '</div>';
 
   if (state.sessionSubStep === 0){
-    // TYPE SELECTION
     const title = document.createElement('div');
     title.className = 'question';
     title.textContent = 'For your ' + ordinal + ' session, what type would you like?';
@@ -1324,7 +1389,6 @@ function renderSession(s){
     s.appendChild(nav);
 
   } else {
-    // GOALS SELECTION
     const session = state.answers.sessions[state.sessionStep];
     if (!session){ state.sessionSubStep = 0; render(); return; }
     const typeKey = session.type;
@@ -1372,7 +1436,6 @@ function renderSession(s){
       opts.appendChild(btn);
     });
 
-    // Other — free text
     const otherValue = (session.goals || []).find(function(g){ return g.startsWith('Other: '); }) || '';
     const otherText = otherValue ? otherValue.replace('Other: ', '') : '';
     const isOtherSelected = !!otherValue;
@@ -1389,27 +1452,24 @@ function renderSession(s){
       if (existing){
         session.goals = cur.filter(function(g){ return !g.startsWith('Other: '); });
       } else {
-        // Clicking Other clears "not sure"
         session.goals = cur.filter(function(g){ return g !== '__notsure__'; }).concat(['Other: ']);
       }
       render();
     });
     opts.appendChild(otherBtn);
 
-    // "I'm not sure" option — mutually exclusive radio-style button (after Other)
     const isNotSure = (session.goals || []).includes('__notsure__');
     if (isNotSure) note.style.display = 'none';
     const notSureBtn = document.createElement('button');
     notSureBtn.className = 'opt opt-notsure' + (isNotSure ? ' selected' : '');
     notSureBtn.style.cssText = '';
-    notSureBtn.innerHTML = '<span class="opt-marker">' + (isNotSure ? '&#9679;' : '') + '</span><span>I’m not sure yet</span>';
+    notSureBtn.innerHTML = '<span class="opt-marker">' + (isNotSure ? '&#9679;' : '') + '</span><span>I\u2019m not sure yet</span>';
     notSureBtn.onclick = function(){
       session.goals = isNotSure ? [] : ['__notsure__'];
       render();
     };
     opts.appendChild(notSureBtn);
 
-    // Dim all other options when "not sure" is selected
     if (isNotSure){
       opts.querySelectorAll('.opt').forEach(function(b){
         if (b !== notSureBtn){ b.style.opacity = '0.35'; b.style.pointerEvents = 'none'; }
@@ -1476,9 +1536,6 @@ function renderSession(s){
 // ─────────────────────────────────────────────
 const SUBJECT_LABELS = { math:'Math', ela:'ELA', reading:'Reading', science:'Science', english:'English', writing:'Writing', notsure:'Not sure yet' };
 
-// Assign subjects to sessions by rotating through the selected subjects.
-// Each session that warrants a subject focus gets the next one in the list,
-// cycling back if there are more sessions than subjects.
 function buildSubjectAssignments(sessions, subjects){
   if (!subjects || subjects.length === 0) return {};
   const relevant = sessions.map((sess, i) => i).filter(i => {
@@ -1522,7 +1579,6 @@ function sessionSummary(sess){
   const goals = sess.goals || [];
   const isReviewPT = type === 'afterpt';
 
-  // Convert imperative goals to gerund form for natural sentence flow
   function toGerund(g){
     return g
       .replace(/^Make TFT/, 'Making TFT')
@@ -1543,20 +1599,15 @@ function sessionSummary(sess){
       .replace(/^Walkthrough /, 'Walking through ');
   }
 
-  // Build a natural sentence from the goals — keep original casing, just strip 'Other: ' prefix
-  // and expand TFT acronym on first mention
   function formatGoal(g, idx, tftSeen){
     let text = g.replace(/^Other: /i, '');
     text = toGerund(text);
-    // Expand TFT on first occurrence only
     if (!tftSeen[0] && text.includes('TFT cards')){
-      // TFT already expanded in goal text
       tftSeen[0] = true;
     }
     return text;
   }
 
-  // "Not sure" selected — return the special placeholder message
   if (goals.includes('__notsure__')){
     return 'Since you have not indicated what you would like to work on, let us know what the focus of this session will be before the session.';
   }
@@ -1581,7 +1632,6 @@ function sessionSummary(sess){
     sentence = 'This session covers ' + rest + ', and ' + last + '.';
   }
 
-  // Add type-specific context
   if (type === 'intro') sentence += ' A good starting point before independent study begins.';
   if (type === 'checkin') sentence += ' This is a check-in during the self-study phase.';
   if (type === 'beforept') sentence += ' This session gets you ready to sit the practice test independently.';
@@ -1602,12 +1652,11 @@ function renderResults(s){
   const subjects = state.answers.subjects || [];
 
   s.innerHTML = `
-    <div class="result-eyebrow">Your Plan</div>
-    <div class="result-title">Here's ${name}'s session plan</div>
-    <div class="result-sub">Based on your answers, here's how we'd structure your sessions.</div>
+    <div class="result-eyebrow">Recommended Plan</div>
+    <div class="result-title">Here's ${name}'s recommended session plan</div>
+    <div class="result-sub">Based on your answers, here's our recommended structure for your sessions. Your scheduler may adjust timing as needed.</div>
   `;
 
-  // ── helper: format start date as e.g. "July 20th"
   function formatStartDate(str){
     if (!str) return '';
     const [y,m,d] = str.split('-').map(Number);
@@ -1617,10 +1666,8 @@ function renderResults(s){
     return date.toLocaleDateString('en-US',{month:'long'}) + ' ' + day + suffix;
   }
 
-  // ── Student info summary block (shows in PDF)
   const infoBlock = document.createElement('div');
   infoBlock.setAttribute('data-pdf', 'info');
-
 
   const a = state.answers;
   const DAY_LABELS = {mon:'Monday',tue:'Tuesday',wed:'Wednesday',thu:'Thursday',fri:'Friday',sat:'Saturday',sun:'Sunday'};
@@ -1630,11 +1677,6 @@ function renderResults(s){
   const AHEAD_LABELS = {day:'Just a day or two', week:'About a week out', month:'A few weeks to a month', open:'Fairly open and predictable'};
   const FREQ_LABELS = {'1x':'1x per week','2x':'2x per week','intensive':'Intensive (3+ per week)','notsure':'Not sure yet'};
   const LIMIT_LABELS = {yes:'Only confirmed through a certain date', no:'Fairly open'};
-
-  function infoRow(label, val){
-    if (!val) return '';
-    return '<div><strong>' + label + ':</strong> ' + val + '</div>';
-  }
 
   const availDays = (a.availabledays||[]).map(d => DAY_LABELS[d]||d).join(', ');
   const timeWins  = (a.timewindows||[]).map(t => TIME_LABELS[t]||t).join(', ');
@@ -1685,13 +1727,10 @@ function renderResults(s){
   list.id = 'planList';
   list.setAttribute('data-pdf', 'sessions');
 
-
-
   const startDateStr = formatStartDate(state.answers.startdate);
   const hasIntro = sessions.some(sess => sess.type === 'intro');
 
-  // In-between note helper
-  function inBetweenNote(html, label){ 
+  function inBetweenNote(html, label){
     const el = document.createElement('div');
     el.className = 'inbetween';
     el.innerHTML = `
@@ -1708,7 +1747,6 @@ function renderResults(s){
     return el;
   }
 
-  // ── Start date marker
   const startMarker = document.createElement('div');
   startMarker.className = 'start-marker';
   startMarker.innerHTML = `
@@ -1724,7 +1762,6 @@ function renderResults(s){
     const prevSess = i > 0 ? sessions[i-1] : null;
     const prevType = prevSess ? prevSess.type : null;
 
-    // ── Insert practice test marker before the anchor session
     if (i === ptAnchorIdx && hasPT && ptWeek){
       const marker = document.createElement('div');
       marker.className = 'pt-marker';
@@ -1743,7 +1780,6 @@ function renderResults(s){
       list.appendChild(marker);
     }
 
-    // ── Insert in-between note before this session — every transition gets one
     const curType = sess.type;
     const phase = (curType === 'intro' || curType === 'checkin') ? 'study'
       : curType === 'beforept' ? 'beforept'
@@ -1756,7 +1792,6 @@ function renderResults(s){
       : prevType === 'afterpt' ? 'afterpt'
       : 'post';
 
-    // First session with no prior session — only show if no intro
     if (i === 0 && !hasIntro){
       if (phase === 'study'){
         list.appendChild(inBetweenNote('Start working through the binder. Watch the video modules, take notes, do the homework, and make TFT cards of problems you got wrong.', 'Before your first session'));
@@ -1768,8 +1803,6 @@ function renderResults(s){
         list.appendChild(inBetweenNote('Make sure all your binder lessons are complete and your TFT cards are reviewed before test day prep.', 'Before your first session'));
       }
     }
-
-    // All subsequent sessions
     else if (i > 0){
       if (prevPhase === 'study' && phase === 'study'){
         list.appendChild(inBetweenNote('Continue working through your binder lessons, watch the video modules, take notes, and do the homework. Make TFT cards of problems you got wrong.', 'In between sessions'));
@@ -1811,7 +1844,6 @@ function renderResults(s){
     list.appendChild(row);
   });
 
-  // Focus areas block — shown once above the timeline
   if (subjects && subjects.length > 0){
     const focusEl = document.createElement('div');
     focusEl.className = 'focus-areas';
@@ -1825,7 +1857,6 @@ function renderResults(s){
 
   s.appendChild(list);
 
-  // ── Test date marker at the bottom of the timeline
   if (state.answers.testdate){
     const testDateStr = formatStartDate(state.answers.testdate);
     const testMarker = document.createElement('div');
@@ -1840,14 +1871,12 @@ function renderResults(s){
     list.appendChild(testMarker);
   }
 
-  // Snapshot info block and session list separately for two-page PDF
   const infoBlockEl = s.querySelector('[data-pdf="info"]');
   const sessionListEl = s.querySelector('[data-pdf="sessions"]');
   const infoBlockHTML = infoBlockEl ? infoBlockEl.outerHTML : '';
   const sessionListHTML = sessionListEl ? sessionListEl.outerHTML : '';
   const RENDER_WIDTH = s.offsetWidth || 700;
 
-  // Satisfy
   const satisfy = document.createElement('div');
   satisfy.className = 'satisfy';
   satisfy.innerHTML = `
@@ -1883,12 +1912,11 @@ function renderResults(s){
   async function generatePlanPDF(){
     const { jsPDF } = window.jspdf;
     const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-    const PW = pdf.internal.pageSize.getWidth();   // 210mm
-    const PH = pdf.internal.pageSize.getHeight();  // 297mm
+    const PW = pdf.internal.pageSize.getWidth();
+    const PH = pdf.internal.pageSize.getHeight();
     const margin = 14;
     const contentW = PW - margin * 2;
 
-    // ── Helper: place a canvas across one or more pages
     function placeCanvas(canvas, pdf, startPage){
       const imgData = canvas.toDataURL('image/jpeg', 0.92);
       const imgH = (canvas.height / canvas.width) * contentW;
@@ -1903,23 +1931,21 @@ function renderResults(s){
       }
     }
 
-    // ── Page 1: header + info block
     const headerHTML =
       '<div style="border-bottom:3px solid #1B2A4A;padding-bottom:16px;margin-bottom:24px;">' +
         '<div style="font-size:11px;font-weight:700;letter-spacing:.12em;color:#C0392B;text-transform:uppercase;margin-bottom:6px;">Wildewood Education</div>' +
-        '<div style="font-size:26px;font-weight:800;color:#1B2A4A;letter-spacing:-.01em;">Session Plan</div>' +
+        '<div style="font-size:26px;font-weight:800;color:#1B2A4A;letter-spacing:-.01em;">Recommended Session Plan</div>' +
         '<div style="font-size:16px;font-weight:600;color:#1B2A4A;margin-top:4px;">' + name + '</div>' +
       '</div>';
 
     const page1Canvas = await renderSection(headerHTML + infoBlockHTML, '#FCFBF8');
     placeCanvas(page1Canvas, pdf);
 
-    // ── Page 2+: session timeline
     pdf.addPage();
     const page2Header =
       '<div style="border-bottom:2px solid #1B2A4A;padding-bottom:12px;margin-bottom:20px;">' +
         '<div style="font-size:11px;font-weight:700;letter-spacing:.12em;color:#C0392B;text-transform:uppercase;margin-bottom:4px;">Wildewood Education</div>' +
-        '<div style="font-size:20px;font-weight:800;color:#1B2A4A;">Session Timeline — ' + name + '</div>' +
+        '<div style="font-size:20px;font-weight:800;color:#1B2A4A;">Recommended Session Timeline \u2014 ' + name + '</div>' +
       '</div>';
     const page2Canvas = await renderSection(page2Header + sessionListHTML, '#FCFBF8');
     placeCanvas(page2Canvas, pdf);
@@ -2056,10 +2082,8 @@ function buildSummaryText(sessionWeeks, ptWeek){
 }
 
 function generatePDF(sessionWeeks, ptWeek){
-  // Print the actual rendered results screen — this captures exactly what
-  // the student sees, styling and all, without rebuilding it separately
   window.print();
-  return null; // no blob needed — print dialog handles it
+  return null;
 }
 
 function downloadPDF(sessionWeeks, ptWeek){
@@ -2075,6 +2099,7 @@ footer.textContent = '\u00a9 Wildewood Education Group LLC';
 document.querySelector('.page').appendChild(footer);
 
 render();
+  
 </script>
 </body>
 </html>
