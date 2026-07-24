@@ -1637,6 +1637,7 @@ function sessionSummary(sess){
   if (type === 'beforept') sentence += ' This session gets you ready to sit the practice test independently.';
   if (type === 'afterpt') sentence += ' Your practice test results are the anchor — everything else builds on them.';
   if (type === 'testday') sentence += ' This session focuses on building confidence and readiness before test day.';
+
   return sentence;
 }
 
@@ -1701,7 +1702,7 @@ function renderResults(s){
       ['Name', name],
       ['Test', a.testtype ? a.testtype.toUpperCase() : ''],
       ['Test date', a.testdate ? formatStartDate(a.testdate) : ''],
-      ['Start date', a.startdate ? formatStartDate(a.startdate) : ''],
+      ['Start date (when you prefer to start studying; not necessarily Session 1)', a.startdate ? formatStartDate(a.startdate) : ''],
       ['Sessions', a.sessioncount],
       ['Subjects', (a.subjects||[]).map(function(sub){ return SUBJECT_LABELS[sub]||sub; }).join(', ')],
       ['Prior study', PRIOR_LABELS[a.priorstudy] || a.priorstudy],
@@ -2098,7 +2099,6 @@ footer.textContent = '\u00a9 Wildewood Education Group LLC';
 document.querySelector('.page').appendChild(footer);
 
 render();
-  
 </script>
 </body>
 </html>
